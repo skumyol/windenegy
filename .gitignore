@@ -1,0 +1,90 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Testing
+.coverage
+artifacts/coverage.xml
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+htmlcov/
+
+# Data (keep structure, ignore contents)
+data/raw/*.csv
+!data/raw/.gitkeep
+data/interim/*.parquet
+data/interim/*.csv
+!data/interim/.gitkeep
+data/processed/*.parquet
+data/processed/*.csv
+!data/processed/.gitkeep
+
+# Artifacts (keep structure, ignore contents)
+artifacts/models/*
+!artifacts/models/.gitkeep
+artifacts/metrics/*.json
+artifacts/metrics/*.yaml
+!artifacts/metrics/.gitkeep
+artifacts/reports/*.html
+artifacts/reports/*.pdf
+!artifacts/reports/.gitkeep
+
+# Notebooks
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+*.tmp

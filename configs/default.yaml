@@ -1,0 +1,50 @@
+# Default configuration for Windenegy
+# Override via environment variables (WINDENEGY_* prefix) or .env file
+
+env: development
+debug: false
+version: "0.1.0"
+
+data:
+  raw_path: "data/raw"
+  interim_path: "data/interim"
+  processed_path: "data/processed"
+  fixture_path: "tests/fixtures"
+  scada_filename: "T1.csv"
+  train_split: 0.7
+  validation_split: 0.15
+
+model:
+  artifacts_path: "artifacts/models"
+  metrics_path: "artifacts/metrics"
+  reports_path: "artifacts/reports"
+  default_model: "gradient_boosting"
+  sequence_length: 144  # 24 hours of 10-minute data
+  prediction_horizon: 6
+  gbm_n_estimators: 200
+  gbm_learning_rate: 0.05
+  gbm_max_depth: 6
+  gbm_early_stopping_rounds: 20
+
+api:
+  host: "0.0.0.0"
+  port: 8000
+  reload: false
+  log_level: "info"
+  max_requests_per_minute: 60
+
+dashboard:
+  port: 8501
+  api_url: "http://localhost:8000"
+  refresh_interval_seconds: 30
+
+weather:
+  provider: "null"  # options: openmeteo, era5, null
+  cache_enabled: true
+  cache_ttl_hours: 24
+  openmeteo_base_url: "https://archive-api.open-meteo.com/v1"
+
+logging:
+  level: "INFO"
+  format: "console"  # options: json, console
+  include_traceback: true

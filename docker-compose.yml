@@ -1,0 +1,53 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    image: windenegy:latest
+    container_name: windenegy-api
+    ports:
+      - "8765:8765"
+    environment:
+      - WINDENEGY_ENV=production
+      - WINDENEGY_API_HOST=0.0.0.0
+      - WINDENEGY_API_PORT=8765
+      - WINDENEGY_API_LOG_LEVEL=info
+      - WINDENEGY_DATA_RAW_PATH=/app/data/raw
+      - WINDENEGY_MODEL_ARTIFACTS_PATH=/app/artifacts/models
+    volumes:
+      - ./data:/app/data:ro
+      - ./artifacts:/app/artifacts
+    command: uvicorn windenegy.interface.api:app --host 0.0.0.0 --port 8765
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8765/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - windenegy-network
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    image: windenegy:latest
+    container_name: windenegy-dashboard
+    ports:
+      - "8766:8766"
+    environment:
+      - WINDENEGY_ENV=production
+      - WINDENEGY_DASHBOARD_PORT=8766
+      - WINDENEGY_DASHBOARD_API_URL=http://api:8765
+    depends_on:
+      api:
+        condition: service_healthy
+    command: streamlit run src/windenegy/interface/dashboard.py --server.port 8766 --server.address 0.0.0.0
+    networks:
+      - windenegy-network
+
+networks:
+  windenegy-network:
+    driver: bridge

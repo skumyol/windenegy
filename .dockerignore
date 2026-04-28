@@ -1,0 +1,16 @@
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.pyc
+.coverage
+artifacts/coverage.xml
+artifacts/models/*
+artifacts/metrics/*.json
+artifacts/reports/*
+dist/
+build/
+*.egg-info/
+.env
+.git/
