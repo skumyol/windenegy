@@ -129,9 +129,11 @@ class WeatherConfig(BaseSettings):
         frozen=True,
     )
 
-    provider: Literal["openmeteo", "era5", "null"] = Field(default="null")
+    provider: Literal["openmeteo", "era5", "null"] = Field(default="openmeteo")
     cache_enabled: bool = Field(default=True)
     cache_ttl_hours: int = Field(default=24, ge=1)
+    latitude: float = Field(default=52.52)
+    longitude: float = Field(default=13.405)
 
     # Open-Meteo specific
     openmeteo_base_url: str = Field(default="https://archive-api.open-meteo.com/v1")

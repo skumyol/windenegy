@@ -14,6 +14,11 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 API_PORT="${WINDENEGY_API_PORT:-8765}"
 DASHBOARD_PORT="${WINDENEGY_DASHBOARD_PORT:-8766}"
 
+# Ensure data and artifacts exist for volume mounts
+mkdir -p "${PROJECT_ROOT}/data/raw"
+mkdir -p "${PROJECT_ROOT}/artifacts/models"
+mkdir -p "${PROJECT_ROOT}/artifacts/metrics"
+
 cd "$PROJECT_ROOT"
 
 # Check if Docker and Docker Compose are available

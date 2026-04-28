@@ -1,5 +1,5 @@
 # Multi-stage build for production efficiency
-FROM python:3.11-slim AS builder
+FROM python:3.12-slim AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -17,7 +17,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir "."
 
 # Production stage
-FROM python:3.11-slim AS production
+FROM python:3.12-slim AS production
 
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -49,11 +49,11 @@ RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
 USER appuser
 
 # Expose ports for API and dashboard
-EXPOSE 8000 8501
+EXPOSE 8765 8766
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import windenegy" || exit 1
+    CMD curl -f http://localhost:8765/health || exit 1
 
 # Default command (can be overridden)
-CMD ["python", "-m", "windenegy.interface.api"]
+CMD ["uvicorn", "windenegy.interface.api:app", "--host", "0.0.0.0", "--port", "8765"]

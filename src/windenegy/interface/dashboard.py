@@ -20,10 +20,16 @@ import pandas as pd
 import requests
 import streamlit as st
 
+from windenegy.application.training import forecast_points_from_model
+from windenegy.domain.models import TurbineObservation
+from windenegy.infrastructure.persistence import FileSystemModelRepository
+
 API_URL = os.getenv("WINDENEGY_DASHBOARD_API_URL", "http://localhost:8765")
 DATA_PATH = Path(os.getenv("WINDENEGY_DATA_RAW_PATH", "data/raw")) / "T1.csv"
 MODELS_DIR = Path(os.getenv("WINDENEGY_MODEL_ARTIFACTS_PATH", "artifacts/models"))
+METRICS_DIR = Path(os.getenv("WINDENEGY_MODEL_METRICS_PATH", "artifacts/metrics"))
 CAPACITY_KW = 3600.0  # Turbine rated capacity (T1 is ~3.6 MW)
+MODEL_COLORS = ["#c0392b", "#f39c12", "#8e44ad", "#16a085", "#2c3e50"]
 
 
 st.set_page_config(
@@ -71,6 +77,61 @@ def load_model_registry() -> list[dict[str, Any]]:
     return models
 
 
+@st.cache_data
+def load_test_outputs(model_version: str | None) -> pd.DataFrame:
+    """Load persisted one-to-one test predictions for a trained model."""
+    if not model_version:
+        return pd.DataFrame()
+    path = METRICS_DIR / f"{model_version}_test_outputs.csv"
+    if not path.exists():
+        return pd.DataFrame()
+    df = pd.read_csv(path)
+    if "timestamp" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+    return df
+
+
+@st.cache_data
+def load_model_comparison() -> dict[str, Any]:
+    """Load the unified model-comparison artifact written by train_all.py.
+
+    Returns a dict with keys:
+        - ``generated_at``: ISO timestamp.
+        - ``split``: split metadata.
+        - ``horizons``: list of horizons evaluated.
+        - ``results``: list of per-(model, horizon) rows.
+    Returns an empty dict if no comparison has been run.
+    """
+    path = METRICS_DIR / "model_comparison.json"
+    if not path.exists():
+        return {}
+    try:
+        with path.open() as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+    # Back-compat: old format was a bare list. Wrap it.
+    if isinstance(data, list):
+        return {"results": data, "split": {}, "horizons": []}
+    return cast("dict[str, Any]", data)
+
+
+@st.cache_data
+def load_test_outputs_by_id(test_outputs_path: str | None) -> pd.DataFrame:
+    """Load a per-model test-output CSV by its absolute or repo-relative path."""
+    if not test_outputs_path:
+        return pd.DataFrame()
+    path = Path(test_outputs_path)
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    if not path.exists():
+        return pd.DataFrame()
+    df = pd.read_csv(path)
+    if "timestamp" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+    return df
+
+
 def get_api_metadata() -> dict[str, Any]:
     """Fetch live API metadata."""
     try:
@@ -109,6 +170,14 @@ def request_forecast(observations: list[dict[str, Any]], horizon: int) -> dict[s
         return None
 
 
+def _iso(ts: Any) -> str:
+    """Convert datetime / Timestamp to ISO string for JSON."""
+    if isinstance(ts, str):
+        return ts
+    # pandas Timestamp or datetime
+    return ts.isoformat()
+
+
 def request_risk(forecast: dict[str, Any]) -> dict[str, Any] | None:
     """Call /risk/assess with a forecast result."""
     points = forecast.get("forecast", [])
@@ -116,7 +185,7 @@ def request_risk(forecast: dict[str, Any]) -> dict[str, Any] | None:
         return None
     payload = {
         "asset_id": forecast.get("asset_id", "T1"),
-        "timestamps": [p["timestamp"] for p in points],
+        "timestamps": [_iso(p["timestamp"]) for p in points],
         "p50_forecast": [p["p50"] for p in points],
         "p10_forecast": [p["p10"] for p in points],
         "p90_forecast": [p["p90"] for p in points],
@@ -129,6 +198,216 @@ def request_risk(forecast: dict[str, Any]) -> dict[str, Any] | None:
     except requests.RequestException as exc:
         st.error(f"Risk API error: {exc}")
         return None
+
+
+def render_forecast_legend() -> None:
+    """Render a stable legend for the forecast chart.
+
+    Altair's automatic legend handling gets brittle once we layer fixed-color
+    marks, so we render the legend explicitly to keep the label semantics and
+    line styles stable across environments.
+    """
+    st.markdown(
+        """
+        <div style="display:flex; flex-wrap:wrap; gap:14px; align-items:center; margin: 0.25rem 0 0.75rem 0;">
+          <span style="display:inline-flex; align-items:center; gap:8px;">
+            <span style="width:18px; height:0; border-top:3px solid #3498db; display:inline-block;"></span>
+            <span>History (blue, last 2h)</span>
+          </span>
+          <span style="display:inline-flex; align-items:center; gap:8px;">
+            <span style="width:18px; height:0; border-top:3px dashed #7f8c8d; display:inline-block;"></span>
+            <span>Now (dashed line)</span>
+          </span>
+          <span style="display:inline-flex; align-items:center; gap:8px;">
+            <span style="display:inline-flex; align-items:center; gap:4px;">
+              <span style="width:18px; height:0; border-top:3px solid #c0392b; display:inline-block;"></span>
+              <span style="width:12px; height:10px; background:rgba(231, 76, 60, 0.22); display:inline-block; border:1px solid rgba(192, 57, 43, 0.25);"></span>
+            </span>
+            <span>Forecast P50 (red) with P10–P90 band (shaded)</span>
+          </span>
+          <span style="display:inline-flex; align-items:center; gap:8px;">
+            <span style="width:18px; height:0; border-top:3px dashed #27ae60; display:inline-block;"></span>
+            <span>Actual (green dashed) = ground truth</span>
+          </span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_multi_model_legend(model_series: list[dict[str, str]]) -> None:
+    """Render a stable legend for the multi-model overlay."""
+    items = [
+        """
+          <span style="display:inline-flex; align-items:center; gap:8px;">
+            <span style="width:18px; height:0; border-top:3px solid #3498db; display:inline-block;"></span>
+            <span>History (blue, last 2h)</span>
+          </span>
+        """,
+        """
+          <span style="display:inline-flex; align-items:center; gap:8px;">
+            <span style="width:18px; height:0; border-top:3px dashed #7f8c8d; display:inline-block;"></span>
+            <span>Now (dashed line)</span>
+          </span>
+        """,
+        """
+          <span style="display:inline-flex; align-items:center; gap:8px;">
+            <span style="width:18px; height:0; border-top:3px dashed #27ae60; display:inline-block;"></span>
+            <span>Actual (green dashed) = ground truth</span>
+          </span>
+        """,
+    ]
+    for series in model_series:
+        items.append(
+            f"""
+              <span style="display:inline-flex; align-items:center; gap:8px;">
+                <span style="width:18px; height:0; border-top:3px solid {series['color']}; display:inline-block;"></span>
+                <span>{series['label']}</span>
+              </span>
+            """
+        )
+    st.markdown(
+        f"""
+        <div style="display:flex; flex-wrap:wrap; gap:14px; align-items:center; margin: 0.25rem 0 0.75rem 0;">
+          {''.join(items)}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _build_prediction_overlay_frame(
+    history_df: pd.DataFrame,
+    actual_df: pd.DataFrame,
+    model_overlays: list[dict[str, Any]],
+) -> pd.DataFrame:
+    """Convert history, gold data, and model forecasts into one plotting frame."""
+    frames: list[pd.DataFrame] = []
+
+    if not history_df.empty:
+        frames.append(
+            history_df.loc[:, ["timestamp", "active_power_kw"]]
+            .rename(columns={"active_power_kw": "value"})
+            .assign(series="Observed history", kind="history")
+        )
+
+    if not actual_df.empty:
+        frames.append(
+            actual_df.loc[:, ["timestamp", "active_power_kw"]]
+            .rename(columns={"active_power_kw": "value"})
+            .assign(series="Gold data", kind="actual")
+        )
+
+    for overlay in model_overlays:
+        overlay_df = pd.DataFrame(overlay.get("points", []))
+        if overlay_df.empty:
+            continue
+        overlay_df = overlay_df.loc[:, ["timestamp", "p50"]].copy()
+        overlay_df["timestamp"] = pd.to_datetime(overlay_df["timestamp"], utc=True)
+        overlay_df = overlay_df.rename(columns={"p50": "value"})
+        overlay_df["series"] = overlay["label"]
+        overlay_df["kind"] = "model"
+        frames.append(overlay_df)
+
+    if not frames:
+        return pd.DataFrame(columns=["timestamp", "value", "series", "kind"])
+
+    overlay_df = pd.concat(frames, ignore_index=True)
+    overlay_df["timestamp"] = pd.to_datetime(overlay_df["timestamp"], utc=True)
+    overlay_df["value"] = pd.to_numeric(overlay_df["value"], errors="coerce")
+    return overlay_df.dropna(subset=["timestamp", "value", "series"])
+
+
+def _build_patchtst_sequence(input_slice: pd.DataFrame, seq_len: int) -> np.ndarray:
+    """Build the sequence tensor used by the PatchTST stand-in."""
+    feature_cols = [
+        "wind_speed_mps",
+        "theoretical_power_kwh",
+        "wind_direction_deg",
+    ]
+    frame = input_slice.tail(seq_len)
+    if len(frame) < seq_len:
+        msg = f"Need at least {seq_len} observations for PatchTST prediction"
+        raise ValueError(msg)
+    return frame[feature_cols].to_numpy(dtype=float)
+
+
+def _forecast_from_model_artifact(
+    model_meta: dict[str, Any],
+    input_slice: pd.DataFrame,
+) -> list[dict[str, Any]] | None:
+    """Load one saved model artifact and build its forecast points."""
+    model_dir = model_meta.get("_path")
+    model_version = model_meta.get("model_version")
+    model_type = model_meta.get("model_type")
+    if not model_dir or not model_version or not model_type:
+        return None
+
+    repository = FileSystemModelRepository(Path(model_dir).parent)
+    try:
+        model, metadata = repository.load_model(model_version)
+    except FileNotFoundError:
+        return None
+
+    observations = [
+        TurbineObservation(
+            timestamp=row.timestamp,
+            active_power_kw=float(row.active_power_kw),
+            wind_speed_mps=float(row.wind_speed_mps),
+            wind_direction_deg=float(row.wind_direction_deg),
+            theoretical_power_kwh=float(row.theoretical_power_kwh),
+        )
+        for row in input_slice.itertuples(index=False)
+    ]
+
+    if metadata.model_type == "gradient_boosting":
+        points = forecast_points_from_model(
+            model,
+            observations=observations,
+            created_at=datetime.now(UTC),
+        )
+        return [
+            {
+                "timestamp": point["timestamp"],
+                "p50": float(point["p50"]),
+                "p10": float(point["p10"]),
+                "p90": float(point["p90"]),
+            }
+            for point in points
+        ]
+
+    if metadata.model_type == "patchtst":
+        try:
+            config_snapshot = metadata.config_snapshot or {}
+            seq_len = int(config_snapshot.get("seq_len", 144))
+            residual_p90 = float(config_snapshot.get("residual_p90", 200.0))
+            if len(input_slice) < seq_len:
+                return None
+            sequence = _build_patchtst_sequence(input_slice, seq_len)
+            prediction = np.asarray(model.predict(sequence), dtype=float).flatten()
+            if prediction.size == 0:
+                return None
+
+            pred_len = int(config_snapshot.get("pred_len", len(prediction)))
+            if prediction.size == 1 and pred_len > 1:
+                prediction = np.repeat(prediction, pred_len)
+
+            timestamps = pd.to_datetime(input_slice["timestamp"], utc=True)
+            step = timestamps.iloc[-1] - timestamps.iloc[-2] if len(timestamps) >= 2 else pd.Timedelta(minutes=10)
+            start = pd.to_datetime(input_slice["timestamp"].iloc[-1], utc=True)
+            return [
+                {
+                    "timestamp": start + step * (index + 1),
+                    "p50": round(float(value), 3),
+                    "p10": round(max(0.0, float(value) - residual_p90), 3),
+                    "p90": round(float(value) + residual_p90, 3),
+                }
+                for index, value in enumerate(prediction[:pred_len])
+            ]
+        except Exception as exc:
+            return None
+
+    return None
 
 
 # ============================================================================
@@ -249,14 +528,14 @@ with tab_data:
             st.dataframe(
                 sample[["active_power_kw", "wind_speed_mps", "theoretical_power_kwh", "wind_direction_deg"]]
                 .describe().round(2),
-                use_container_width=True,
+                width="stretch",
             )
         with col_raw:
             st.markdown("**Sample observations (head)**")
             display_sample = sample.head(10).copy()
             num_cols = display_sample.select_dtypes(include=["number"]).columns
             display_sample[num_cols] = display_sample[num_cols].round(2)
-            st.dataframe(display_sample, use_container_width=True, height=300)
+            st.dataframe(display_sample, width="stretch", height=300)
 
 
 # ----------------------------------------------------------------------------
@@ -285,7 +564,7 @@ with tab_models:
                 "P90 coverage": f"{metrics.get('coverage_p90', 0)*100:.1f}%",
             })
         comp_df = pd.DataFrame(comp_rows)
-        st.dataframe(comp_df, use_container_width=True, hide_index=True)
+        st.dataframe(comp_df, width="stretch", hide_index=True)
         st.caption(
             "**Skill score**: improvement over persistence baseline (>0 is better). "
             "**P90 coverage**: fraction of actuals inside the P10\u2013P90 interval (target: 80%)."
@@ -359,7 +638,7 @@ SCADA observations (N \u2265 25 obs)
             feat_df = pd.DataFrame(
                 [{"feature": k, "dtype": v} for k, v in feature_schema.items()]
             )
-            st.dataframe(feat_df, use_container_width=True, hide_index=True, height=240)
+            st.dataframe(feat_df, width="stretch", hide_index=True, height=240)
 
         st.markdown("**Test metrics**")
         st.json(chosen.get("metrics", {}))
@@ -377,14 +656,15 @@ with tab_predict:
         with st.container(border=True):
             st.markdown("### \U0001F4CD Situation")
             st.markdown(
-                "Pick any window from the SCADA history. We feed it to the API, "
-                "and compare the forecast against the **actual future values** (already in the data)."
+                "Pick any window from the SCADA history. We project every saved model on the same test window "
+                "and compare the forecasts against the **actual future values** (already in the data)."
             )
 
         # Task block
         with st.container(border=True):
             st.markdown("### \U0001F3AF Task: Forecast N hours ahead from input window")
             cc = st.columns(3)
+            has_patchtst = any(m.get("model_type") == "patchtst" for m in models)
             with cc[0]:
                 horizon = st.selectbox(
                     "Horizon (hours)", [1, 6, 12, 24], index=1,
@@ -392,8 +672,8 @@ with tab_predict:
                 )
             with cc[1]:
                 input_window_hours = st.selectbox(
-                    "Input window (hours)", [3, 6, 12, 24], index=2,
-                    help="GBM model needs ≥ 25 observations (4h+) to build lag features.",
+                    "Input window (hours)", [6, 12, 24, 36, 48], index=2,
+                    help="PatchTST needs 144 obs (24h). Select 36h+ for 1h horizon.",
                 )
             with cc[2]:
                 window_obs = input_window_hours * 6  # 10-min cadence
@@ -402,9 +682,9 @@ with tab_predict:
                 max_start = max(0, len(df) - window_obs - horizon_obs - 1)
                 start = st.slider("Window start (row)", 0, max_start, max_start // 2, step=144)
 
-        # Action: prepare inputs & call API
+        # Action: prepare inputs and build overlays
         with st.container(border=True):
-            st.markdown("### \u2699\ufe0f Action: Send observations to API")
+            st.markdown("### \u2699\ufe0f Action: Build model overlays")
 
             input_slice = df.iloc[start:start + window_obs].copy()
             actual_future = df.iloc[start + window_obs:start + window_obs + horizon_obs].copy()
@@ -426,25 +706,59 @@ with tab_predict:
             ac[1].metric("Input range", in_range)
             ac[2].metric("Forecast horizon", f"{horizon}h ({horizon_obs} pts)")
 
+            if has_patchtst and window_obs < 144:
+                st.info("PatchTST is hidden for this run because it needs 24h of history. Choose the 24h input window to enable it.")
+
             with st.expander("View input payload (first 3 obs)"):
                 st.json(observations[:3])
 
             forecast = request_forecast(observations, horizon)
+            model_overlays: list[dict[str, Any]] = []
+            if not models:
+                model_overlays.append(
+                    {
+                        "label": forecast.get("model_version", "active-model") if forecast else "active-model",
+                        "color": MODEL_COLORS[0],
+                        "points": forecast.get("forecast", []) if forecast else [],
+                    }
+                )
+            else:
+                for index, model_meta in enumerate(models):
+                    points = _forecast_from_model_artifact(model_meta, input_slice)
+                    if points:
+                        model_overlays.append(
+                            {
+                                "label": f"{model_meta.get('model_version', 'model')}",
+                                "color": MODEL_COLORS[index % len(MODEL_COLORS)],
+                                "points": points,
+                            }
+                        )
+            if not model_overlays and forecast is not None:
+                model_overlays.append(
+                    {
+                        "label": forecast.get("model_version", "active-model"),
+                        "color": MODEL_COLORS[0],
+                        "points": forecast.get("forecast", []),
+                    }
+                )
+            primary_model = model_overlays[0] if model_overlays else None
+            if forecast is None and primary_model is not None:
+                forecast = {
+                    "asset_id": "T1",
+                    "model_version": primary_model["label"],
+                    "forecast": primary_model["points"],
+                    "warnings": [],
+                }
 
         # Result block
         with st.container(border=True):
             st.markdown("### \U0001F4C8 Result: Forecast vs actual")
 
-            if forecast is None:
+            if forecast is None and not model_overlays:
                 st.error("No forecast returned.")
             else:
-                fc_df = pd.DataFrame(forecast["forecast"])
-                fc_df["timestamp"] = pd.to_datetime(fc_df["timestamp"])
-                forecast_start = fc_df["timestamp"].min()
-
                 # Show only last 12 obs (2h) of history so forecast is visible
                 hist_display = input_slice.tail(12)[["timestamp", "active_power_kw"]].copy()
-                hist_display["series"] = "History"
 
                 # Prepare actuals (ground truth) for the forecast window
                 fut_display = (
@@ -452,81 +766,76 @@ with tab_predict:
                     if not actual_future.empty
                     else pd.DataFrame()
                 )
-                if not fut_display.empty:
-                    fut_display["series"] = "Actual (held back)"
 
-                # Build Altair chart: uncertainty band + lines + now marker
-                try:
-                    import altair as alt
+                primary_forecast_df = pd.DataFrame(forecast["forecast"]) if forecast is not None else pd.DataFrame()
+                if not primary_forecast_df.empty:
+                    primary_forecast_df["timestamp"] = pd.to_datetime(primary_forecast_df["timestamp"], utc=True)
 
-                    # Uncertainty band (P10-P90)
-                    band = (
-                        alt.Chart(fc_df)
-                        .mark_area(opacity=0.3, color="#e74c3c")
-                        .encode(
-                            x=alt.X("timestamp:T", title="Time"),
-                            y=alt.Y("p10:Q", title="Power (kW)", scale=alt.Scale(zero=False)),
-                            y2="p90:Q",
-                            tooltip=["timestamp:T", "p10:Q", "p50:Q", "p90:Q"],
-                        )
-                    )
+                overlay_frame = _build_prediction_overlay_frame(hist_display, fut_display, model_overlays)
+                forecast_start = pd.to_datetime(input_slice["timestamp"].iloc[-1], utc=True)
 
-                    # Forecast P50 line
-                    forecast_line = (
-                        alt.Chart(fc_df)
-                        .mark_line(color="#c0392b", strokeWidth=3)
-                        .encode(x="timestamp:T", y="p50:Q", tooltip=["timestamp:T", "p50:Q"])
-                    )
+                # Build Altair chart: one paper-style overlay with shared legend.
+                if overlay_frame.empty:
+                    st.info("No data available for chart.")
+                else:
+                    try:
+                        import altair as alt
 
-                    # History line (last 2h)
-                    hist_line = (
-                        alt.Chart(hist_display)
-                        .mark_line(color="#3498db", strokeWidth=2)
-                        .encode(x="timestamp:T", y="active_power_kw:Q")
-                    )
+                        series_order = ["Observed history", "Gold data"] + [overlay["label"] for overlay in model_overlays]
+                        series_colors = ["#9aa0a6", "#111111"] + [overlay["color"] for overlay in model_overlays]
 
-                    # Actual future line (ground truth)
-                    actual_line = None
-                    if not fut_display.empty:
-                        actual_line = (
-                            alt.Chart(fut_display)
-                            .mark_line(color="#27ae60", strokeWidth=2, strokeDash=[5, 5])
-                            .encode(x="timestamp:T", y="active_power_kw:Q")
+                        forecast_chart = (
+                            alt.Chart(overlay_frame)
+                            .mark_line(strokeWidth=2.75)
+                            .encode(
+                                x=alt.X("timestamp:T", title="Time"),
+                                y=alt.Y("value:Q", title="Power (kW)", scale=alt.Scale(zero=False)),
+                                color=alt.Color(
+                                    "series:N",
+                                    scale=alt.Scale(domain=series_order, range=series_colors),
+                                    legend=alt.Legend(title="Series", orient="top", symbolType="stroke"),
+                                ),
+                                tooltip=[
+                                    alt.Tooltip("series:N", title="Series"),
+                                    alt.Tooltip("timestamp:T", title="Time"),
+                                    alt.Tooltip("value:Q", title="Power (kW)", format=".1f"),
+                                ],
+                            )
                         )
 
-                    # "Now" vertical rule at forecast start
-                    now_rule = (
-                        alt.Chart(pd.DataFrame({"now": [forecast_start]}))
-                        .mark_rule(color="#7f8c8d", strokeDash=[3, 3])
-                        .encode(x="now:T")
-                    )
+                        now_rule = (
+                            alt.Chart(pd.DataFrame({"now": [forecast_start]}))
+                            .mark_rule(color="#7f8c8d", strokeDash=[3, 3])
+                            .encode(x="now:T")
+                        )
 
-                    # Combine layers
-                    layers = [band, forecast_line, hist_line]
-                    if actual_line:
-                        layers.append(actual_line)
-                    layers.append(now_rule)
+                        chart = alt.layer(forecast_chart, now_rule).properties(
+                            width="container",
+                            height=360,
+                            title="Forecast overlay: gold data vs model predictions",
+                        ).interactive()
 
-                    chart = alt.layer(*layers).properties(
-                        width="container",
-                        height=320,
-                    ).interactive()
-
-                    st.altair_chart(chart, use_container_width=True)
-                    st.caption(
-                        "**History** (blue, last 2h) \u2192 **Now** (dashed line) \u2192 "
-                        "**Forecast P50** (red) with **P10\u2013P90 band** (shaded) \u00b7 "
-                        "**Actual** (green dashed) = ground truth"
-                    )
-                except Exception as e:
-                    # Fallback to simple line chart if altair fails
-                    st.error(f"Chart error: {e}")
-                    st.line_chart(fc_df.set_index("timestamp")[["p10", "p50", "p90"]], height=320)
+                        st.altair_chart(chart, width="stretch")
+                        st.caption(
+                            "**Observed history** = recent context \u00b7 **Gold data** = actual future values \u00b7 "
+                            "**Colored lines** = model P50 forecasts \u00b7 **Dashed marker** = forecast origin"
+                        )
+                    except Exception as e:
+                        # Fallback to simple line chart if altair fails
+                        st.error(f"Chart error: {e}")
+                        if not overlay_frame.empty:
+                            fallback = overlay_frame.pivot_table(
+                                index="timestamp",
+                                columns="series",
+                                values="value",
+                                aggfunc="last",
+                            )
+                            st.line_chart(fallback, height=360)
 
                 # Quality metrics
-                if not actual_future.empty:
+                if not actual_future.empty and forecast is not None and not primary_forecast_df.empty:
                     aligned = pd.merge(
-                        fc_df[["timestamp", "p10", "p50", "p90"]],
+                        primary_forecast_df[["timestamp", "p10", "p50", "p90"]],
                         actual_future[["timestamp", "active_power_kw"]],
                         on="timestamp", how="inner",
                     )
@@ -550,7 +859,7 @@ with tab_predict:
                         st.line_chart(resid_df.set_index("timestamp"), height=180)
 
                 # Warnings
-                warns = forecast.get("warnings", [])
+                warns = forecast.get("warnings", []) if forecast is not None else []
                 if warns:
                     for w in warns:
                         st.warning(w)
@@ -609,7 +918,7 @@ with tab_risk:
                             for r in ramps
                         ]
                         st.dataframe(pd.DataFrame(ramp_rows), hide_index=True,
-                                     use_container_width=True)
+                                     width="stretch")
                         st.caption(
                             "A *ramp* is a power change \u2265 10% of capacity within 1 hour. "
                             "Severity scales with magnitude: medium \u2265 10%, high \u2265 25%, critical \u2265 50%."
@@ -632,7 +941,7 @@ with tab_risk:
                             for r in risks[:10]
                         ]
                         st.dataframe(pd.DataFrame(rows), hide_index=True,
-                                     use_container_width=True)
+                                     width="stretch")
                         st.caption(
                             "Probability the P10 forecast falls below 70% of capacity, "
                             "weighted by interval width (uncertainty)."
@@ -646,230 +955,297 @@ with tab_risk:
 # ----------------------------------------------------------------------------
 
 with tab_eval:
-    st.markdown("### \U0001F4CA Model Evaluation: Walk-forward Backtest")
+    st.markdown("### \U0001F4CA Methodological Model Comparison")
     st.caption(
-        "Run multiple models on the same test window to compare predictions vs actuals "
-        "and track error evolution over time."
+        "Every model is trained on the SAME train/val partition and "
+        "evaluated on the SAME chronological test set. Test predictions "
+        "are saved per-row, so the chart below overlays each model on "
+        "top of the actuals on the exact same timeline."
     )
 
-    if df.empty:
-        st.error("Dataset required for evaluation.")
+    comparison = load_model_comparison()
+    results: list[dict[str, Any]] = comparison.get("results", []) if comparison else []
+    split_meta: dict[str, Any] = comparison.get("split", {}) if comparison else {}
+
+    if not results:
+        st.warning(
+            "No comparison artifact found. Run the unified training pipeline:\n\n"
+            "```bash\npython scripts/train_all.py\n```"
+        )
     else:
-        # Controls
+        # ---- Split summary ---------------------------------------------------
         with st.container(border=True):
-            st.markdown("#### \u2699\ufe0f Configure backtest")
-            ec = st.columns(4)
+            st.markdown("#### \U0001F50D Test split")
+            sc = st.columns(4)
+            sc[0].metric("Train rows", f"{split_meta.get('rows_train', 0):,}")
+            sc[1].metric("Val rows", f"{split_meta.get('rows_val', 0):,}")
+            sc[2].metric("Test rows", f"{split_meta.get('rows_test', 0):,}")
+            sc[3].metric(
+                "Step",
+                f"{split_meta.get('step_minutes', 10):.0f} min",
+            )
+            st.caption(
+                f"Train ends: {split_meta.get('train_end_ts', '?')}  ·  "
+                f"Val ends: {split_meta.get('val_end_ts', '?')}  ·  "
+                f"Test ends: {split_meta.get('test_end_ts', '?')}  ·  "
+                f"Generated: {comparison.get('generated_at', '?')}"
+            )
+
+        results_df = pd.DataFrame(results)
+
+        # ---- Comparison table -----------------------------------------------
+        with st.container(border=True):
+            st.markdown("#### \U0001F4CB Comparison table (held-out test set)")
+            display = results_df.copy()
+            display["skill_score"] = display["skill_score"].apply(
+                lambda v: f"{v:+.3f}" if pd.notna(v) else "n/a"
+            )
+            display["coverage_p90"] = display["coverage_p90"].apply(
+                lambda v: f"{v * 100:.1f}%" if pd.notna(v) else "n/a"
+            )
+            display = display.rename(
+                columns={
+                    "model_type": "Model",
+                    "horizon_hours": "Horizon (h)",
+                    "mae": "MAE (kW)",
+                    "rmse": "RMSE (kW)",
+                    "mape": "sMAPE (%)",
+                    "skill_score": "Skill vs persistence",
+                    "coverage_p90": "P10–P90 coverage",
+                    "test_rows": "Test rows",
+                }
+            )
+            st.dataframe(
+                display[
+                    [
+                        "Model",
+                        "Horizon (h)",
+                        "MAE (kW)",
+                        "RMSE (kW)",
+                        "sMAPE (%)",
+                        "Skill vs persistence",
+                        "P10–P90 coverage",
+                        "Test rows",
+                    ]
+                ].round(2),
+                width="stretch",
+                hide_index=True,
+            )
+
+            # Highlight best per horizon
+            best_lines: list[str] = []
+            for h in sorted(results_df["horizon_hours"].unique()):
+                sub = results_df[results_df["horizon_hours"] == h]
+                best = sub.loc[sub["mae"].idxmin()]
+                best_lines.append(
+                    f"**{int(h)}h:** {best['model_type']} "
+                    f"(MAE = {best['mae']:.1f} kW, "
+                    f"skill = {best['skill_score']:+.3f})"
+                )
+            if best_lines:
+                st.success("Best by MAE → " + " · ".join(best_lines))
+
+        # ---- Per-horizon overlay --------------------------------------------
+        horizons_available = sorted(int(h) for h in results_df["horizon_hours"].unique())
+        with st.container(border=True):
+            st.markdown("#### \U0001F4C8 Predictions vs actual (overlay)")
+            ec = st.columns([1, 1, 2])
             with ec[0]:
                 eval_horizon = st.selectbox(
-                    "Forecast horizon", [1, 6], index=0, key="eval_h",
-                    help="1h uses GBM; 6h uses persistence (GBM only trained for 1h).",
+                    "Horizon", horizons_available,
+                    index=0, key="eval_h_overlay",
                 )
+            horizon_rows = results_df[results_df["horizon_hours"] == eval_horizon]
             with ec[1]:
-                eval_window_hours = st.selectbox(
-                    "Test window (hours)", [6, 12, 24, 48], index=1, key="eval_w",
-                    help="Longer windows show more error accumulation patterns.",
+                model_options = horizon_rows["model_type"].unique().tolist()
+                selected_models = st.multiselect(
+                    "Models",
+                    options=model_options,
+                    default=model_options,
+                    key="eval_models",
                 )
-            with ec[2]:
-                max_eval_start = max(0, len(df) - eval_window_hours * 6 - eval_horizon * 6 - 1)
-                # Find an active (non-zero) window for default
-                power_series = df["active_power_kw"].rolling(72).mean()
-                active_idx = power_series[power_series > 500].index.tolist()
-                default_start = (
-                    int(active_idx[len(active_idx) // 2])
-                    if active_idx
-                    else max_eval_start // 2
-                )
-                default_start = min(default_start, max_eval_start)
-                eval_start = st.slider(
-                    "Test start (row)", 0, max_eval_start, default_start,
-                    step=144, key="eval_s",
-                    help="Defaults to an active (windy) period for meaningful results.",
-                )
-            with ec[3]:
-                st.markdown("**Models to compare**")
-                compare_persistence = st.checkbox("Persistence baseline", value=True)
-                compare_gbm = st.checkbox("Gradient Boosting (if 1h)",
-                                           value=(eval_horizon == 1))
 
-        # Run backtest button
-        if st.button("\u25b6\ufe0f Run backtest", type="primary"):
-            with st.spinner("Running walk-forward backtest..."):
-                test_slice = df.iloc[
-                    eval_start:eval_start + eval_window_hours * 6
-                ].copy()
+            # Load all test-output CSVs for the selected horizon + models.
+            per_model: dict[str, pd.DataFrame] = {}
+            for _, row in horizon_rows.iterrows():
+                if row["model_type"] not in selected_models:
+                    continue
+                test_df = load_test_outputs_by_id(row.get("test_outputs_path"))
+                if not test_df.empty:
+                    per_model[row["model_type"]] = test_df
 
-                results = []
-                step_obs = 36  # 6h input window → GBM has enough lags (needs ≥25)
-
-                for i in range(0, len(test_slice) - step_obs - eval_horizon * 6, eval_horizon * 6):
-                    input_win = test_slice.iloc[i:i + step_obs]
-                    actual_win = test_slice.iloc[
-                        i + step_obs:i + step_obs + eval_horizon * 6
-                    ]
-                    if len(actual_win) < eval_horizon * 6:
-                        continue
-
-                    observations = [
-                        {
-                            "timestamp": row.timestamp.isoformat(),
-                            "active_power_kw": float(row.active_power_kw),
-                            "wind_speed_mps": float(row.wind_speed_mps),
-                            "wind_direction_deg": float(row.wind_direction_deg),
-                            "theoretical_power_kwh": float(row.theoretical_power_kwh),
-                        }
-                        for row in input_win.itertuples()
-                    ]
-
-                    # API call (returns GBM if available, else persistence)
-                    if compare_gbm:
-                        fc = request_forecast(observations, eval_horizon)
-                        if fc:
-                            model_ver = fc.get("model_version", "unknown")
-                            for p, actual in zip(
-                                fc.get("forecast", []),
-                                actual_win.itertuples(),
-                                strict=False,
-                            ):
-                                results.append({
-                                    "timestamp": pd.to_datetime(p["timestamp"]),
-                                    "actual_kw": float(actual.active_power_kw),
-                                    "predicted_kw": float(p["p50"]),
-                                    "p10": float(p["p10"]),
-                                    "p90": float(p["p90"]),
-                                    "model": model_ver,
-                                    "error_kw": float(actual.active_power_kw) - float(p["p50"]),
-                                })
-
-                    # Local persistence baseline (last value carried forward)
-                    if compare_persistence:
-                        last_power = float(input_win["active_power_kw"].iloc[-1])
-                        # Estimate residual from input window variance
-                        residual = float(
-                            np.percentile(
-                                np.abs(np.diff(input_win["active_power_kw"].to_numpy())), 90
-                            )
-                        ) * 2 if len(input_win) > 1 else 200.0
-                        for actual in actual_win.itertuples():
-                            results.append({
-                                "timestamp": actual.timestamp,
-                                "actual_kw": float(actual.active_power_kw),
-                                "predicted_kw": last_power,
-                                "p10": max(0.0, last_power - residual),
-                                "p90": last_power + residual,
-                                "model": "persistence-local",
-                                "error_kw": float(actual.active_power_kw) - last_power,
-                            })
-
-            if not results:
-                st.warning("No predictions generated. Check model availability.")
+            if not per_model:
+                st.info("No test outputs found for the selected horizon.")
             else:
-                results_df = pd.DataFrame(results)
+                # Determine common timeline (intersection by timestamp)
+                first_df = next(iter(per_model.values()))
+                ts_min = pd.to_datetime(first_df["timestamp"].min(), utc=True)
+                ts_max = pd.to_datetime(first_df["timestamp"].max(), utc=True)
+                with ec[2]:
+                    span_hours = max(
+                        1,
+                        int((ts_max - ts_min).total_seconds() // 3600),
+                    )
+                    default_window = min(72, span_hours)
+                    window_hours = st.slider(
+                        "Zoom window (hours)",
+                        6, span_hours, default_window,
+                        key="eval_window_hours",
+                    )
+                    max_offset_hours = max(0, span_hours - window_hours)
+                    offset_hours = st.slider(
+                        "Window offset (hours from start)",
+                        0, max_offset_hours,
+                        max_offset_hours // 2 if max_offset_hours else 0,
+                        key="eval_offset_hours",
+                    )
+                window_start = ts_min + pd.Timedelta(hours=offset_hours)
+                window_end = window_start + pd.Timedelta(hours=window_hours)
 
-                # Chart 1: Predictions vs Actuals
-                with st.container(border=True):
-                    st.markdown("#### \U0001F4C8 Chart 1: Predictions vs Actuals")
-
+                # Build long-form frame for Altair: one row per (timestamp, series).
+                # "Actual" series is shared (taken from the first model's CSV).
+                actual_long = (
+                    first_df.loc[
+                        (first_df["timestamp"] >= window_start)
+                        & (first_df["timestamp"] < window_end),
+                        ["timestamp", "actual_kw"],
+                    ]
+                    .rename(columns={"actual_kw": "value"})
+                    .assign(series="Actual")
+                )
+                model_frames = [actual_long]
+                for label, dfm in per_model.items():
+                    sub = dfm.loc[
+                        (dfm["timestamp"] >= window_start)
+                        & (dfm["timestamp"] < window_end),
+                        ["timestamp", "predicted_kw"],
+                    ].rename(columns={"predicted_kw": "value"})
+                    sub = sub.assign(series=label)
+                    model_frames.append(sub)
+                overlay_df = pd.concat(model_frames, ignore_index=True)
+                if overlay_df.empty:
+                    st.info("No data in selected window.")
+                else:
                     try:
                         import altair as alt
 
-                        actual_line = (
-                            alt.Chart(results_df.drop_duplicates("timestamp"))
-                            .mark_line(color="#27ae60", strokeWidth=3)
-                            .encode(x="timestamp:T", y="actual_kw:Q", tooltip=["timestamp:T", "actual_kw:Q"])
-                        )
-
-                        pred_lines = alt.Chart(results_df).mark_line(strokeWidth=2).encode(
-                            x="timestamp:T",
-                            y="predicted_kw:Q",
-                            color=alt.Color(
-                                "model:N",
-                                scale=alt.Scale(
-                                    domain=[
-                                        "persistence-local",
-                                        "persistence-baseline-0.1.0",
-                                        "gradient-boosting-T1-1h",
-                                    ],
-                                    range=["#e74c3c", "#f39c12", "#3498db"],
+                        domain = ["Actual", *list(per_model.keys())]
+                        palette = ["#111111"] + MODEL_COLORS[: len(per_model)]
+                        overlay_chart = (
+                            alt.Chart(overlay_df)
+                            .mark_line(strokeWidth=2)
+                            .encode(
+                                x=alt.X("timestamp:T", title="Time"),
+                                y=alt.Y(
+                                    "value:Q",
+                                    title="Power (kW)",
+                                    scale=alt.Scale(zero=False),
                                 ),
-                                legend=alt.Legend(title="Model"),
-                            ),
-                            tooltip=["timestamp:T", "model:N", "predicted_kw:Q"],
+                                color=alt.Color(
+                                    "series:N",
+                                    scale=alt.Scale(domain=domain, range=palette),
+                                    legend=alt.Legend(title="Series", orient="top"),
+                                ),
+                                tooltip=[
+                                    alt.Tooltip("series:N"),
+                                    alt.Tooltip("timestamp:T"),
+                                    alt.Tooltip("value:Q", format=".1f"),
+                                ],
+                            )
+                            .properties(width="container", height=380)
+                            .interactive()
                         )
-
-                        pred_vs_actual = alt.layer(actual_line, pred_lines).properties(
-                            width="container", height=350,
-                        ).interactive()
-
-                        st.altair_chart(pred_vs_actual, use_container_width=True)
-                        st.caption(
-                            "**Green** = actual (ground truth) \u00b7 "
-                            "**Red/Blue** = model predictions (P50)"
+                        st.altair_chart(overlay_chart, width="stretch")
+                    except Exception as exc:  # pragma: no cover - chart fallback
+                        st.error(f"Chart error: {exc}")
+                        pivot = overlay_df.pivot_table(
+                            index="timestamp", columns="series", values="value"
                         )
-                    except Exception as e:
-                        st.error(f"Chart error: {e}")
-                        pivoted = results_df.pivot_table(
-                            index="timestamp", columns="model", values="predicted_kw"
-                        )
-                        pivoted["actual"] = results_df.drop_duplicates("timestamp").set_index(
-                            "timestamp"
-                        )["actual_kw"]
-                        st.line_chart(pivoted, height=350)
+                        st.line_chart(pivot, height=380)
 
-                # Chart 2: Error over time
-                with st.container(border=True):
-                    st.markdown("#### \U0001F4C9 Chart 2: Error Over Time (Actual \u2212 Predicted)")
-
+                # ---- Error over time --------------------------------------
+                st.markdown("##### Error over time (actual − predicted)")
+                err_frames = []
+                for label, dfm in per_model.items():
+                    sub = dfm.loc[
+                        (dfm["timestamp"] >= window_start)
+                        & (dfm["timestamp"] < window_end),
+                        ["timestamp", "actual_kw", "predicted_kw"],
+                    ].copy()
+                    sub["error_kw"] = sub["actual_kw"] - sub["predicted_kw"]
+                    sub["series"] = label
+                    err_frames.append(sub.loc[:, ["timestamp", "error_kw", "series"]])
+                err_long = pd.concat(err_frames, ignore_index=True) if err_frames else pd.DataFrame()
+                if not err_long.empty and not err_long["error_kw"].isna().all():
                     try:
-                        error_chart = alt.Chart(results_df).mark_line(strokeWidth=2).encode(
-                            x="timestamp:T",
-                            y="error_kw:Q",
-                            color=alt.Color(
-                                "model:N",
-                                scale=alt.Scale(
-                                    domain=[
-                                        "persistence-local",
-                                        "persistence-baseline-0.1.0",
-                                        "gradient-boosting-T1-1h",
-                                    ],
-                                    range=["#e74c3c", "#f39c12", "#3498db"],
-                                ),
-                                legend=alt.Legend(title="Model"),
-                            ),
-                            tooltip=["timestamp:T", "model:N", "error_kw:Q"],
-                        ).properties(width="container", height=280).interactive()
+                        import altair as alt
 
-                        zero_line = (
+                        err_chart = (
+                            alt.Chart(err_long)
+                            .mark_line(strokeWidth=1.5, opacity=0.85)
+                            .encode(
+                                x=alt.X("timestamp:T", title="Time"),
+                                y=alt.Y("error_kw:Q", title="Error (kW)"),
+                                color=alt.Color(
+                                    "series:N",
+                                    scale=alt.Scale(
+                                        domain=list(per_model.keys()),
+                                        range=MODEL_COLORS[: len(per_model)],
+                                    ),
+                                    legend=alt.Legend(title="Model", orient="top"),
+                                ),
+                                tooltip=[
+                                    alt.Tooltip("series:N"),
+                                    alt.Tooltip("timestamp:T"),
+                                    alt.Tooltip("error_kw:Q", format=".1f"),
+                                ],
+                            )
+                            .properties(width="container", height=240)
+                            .interactive()
+                        )
+                        zero = (
                             alt.Chart(pd.DataFrame({"y": [0]}))
                             .mark_rule(color="#7f8c8d", strokeDash=[3, 3])
                             .encode(y="y:Q")
                         )
-
-                        st.altair_chart(alt.layer(error_chart, zero_line), use_container_width=True)
-                        st.caption("Error = actual \u2212 predicted. Closer to zero line = better.")
-                    except Exception as e:
-                        st.error(f"Chart error: {e}")
-                        error_pivot = results_df.pivot_table(
-                            index="timestamp", columns="model", values="error_kw"
+                        st.altair_chart(alt.layer(err_chart, zero), width="stretch")
+                    except Exception:
+                        pivot = err_long.pivot_table(
+                            index="timestamp", columns="series", values="error_kw"
                         )
-                        st.line_chart(error_pivot, height=280)
+                        st.line_chart(pivot, height=240)
 
-                # Metrics summary
-                with st.container(border=True):
-                    st.markdown("#### \U0001F4CB Backtest Metrics Summary")
-                    metrics = []
-                    for model_name, group in results_df.groupby("model"):
-                        metrics.append({
-                            "Model": model_name,
-                            "MAE (kW)": round(group["error_kw"].abs().mean(), 1),
-                            "RMSE (kW)": round(np.sqrt((group["error_kw"] ** 2).mean()), 1),
-                            "Max error (kW)": round(group["error_kw"].abs().max(), 1),
-                            "Bias (kW)": round(group["error_kw"].mean(), 1),
-                            "Coverage": round(
-                                ((group["actual_kw"] >= group["p10"])
-                                 & (group["actual_kw"] <= group["p90"])).mean() * 100, 1
-                            ),
-                        })
-                    st.dataframe(pd.DataFrame(metrics), hide_index=True, use_container_width=True)
+                # ---- Per-model windowed metrics ---------------------------
+                st.markdown("##### Per-model metrics on the visible window")
+                rows = []
+                for label, dfm in per_model.items():
+                    sub = dfm.loc[
+                        (dfm["timestamp"] >= window_start)
+                        & (dfm["timestamp"] < window_end)
+                    ]
+                    if sub.empty:
+                        continue
+                    err = (sub["actual_kw"] - sub["predicted_kw"]).to_numpy()
+                    cov = float(
+                        ((sub["actual_kw"] >= sub["p10"])
+                         & (sub["actual_kw"] <= sub["p90"])).mean()
+                    )
+                    rows.append(
+                        {
+                            "Model": label,
+                            "Rows": len(sub),
+                            "MAE (kW)": round(float(np.abs(err).mean()), 1),
+                            "RMSE (kW)": round(float(np.sqrt((err ** 2).mean())), 1),
+                            "Bias (kW)": round(float(err.mean()), 1),
+                            "P10–P90 coverage": f"{cov * 100:.1f}%",
+                        }
+                    )
+                if rows:
+                    st.dataframe(
+                        pd.DataFrame(rows),
+                        width="stretch",
+                        hide_index=True,
+                    )
 
 
 st.divider()

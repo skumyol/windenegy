@@ -6,16 +6,19 @@ This module provides REST API endpoints for the forecasting service.
 from __future__ import annotations
 
 import os
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, Field
 
+from windenegy.application.training import forecast_points_from_model
 from windenegy.application.forecasting import ForecastService
 from windenegy.application.risk import RampDetector, UnderproductionAnalyzer
 from windenegy.application.training import load_latest_gradient_boosting, metric_summary
+from windenegy.infrastructure.config import AppConfig
+from windenegy.infrastructure.weather_provider import create_provider
 from windenegy.domain.models import (
     ForecastHorizon,
     ForecastPoint,
@@ -32,6 +35,15 @@ app = FastAPI(
 
 forecast_service = ForecastService()
 model_dir = Path(os.getenv("WINDENEGY_MODEL_ARTIFACTS_PATH", "artifacts/models"))
+
+config = AppConfig()
+weather_provider = None
+if config.weather.provider == "openmeteo":
+    weather_provider = create_provider(
+        latitude=config.weather.latitude,
+        longitude=config.weather.longitude,
+        provider_type="openmeteo",
+    )
 
 
 class ForecastRequest(BaseModel):
@@ -94,6 +106,7 @@ async def get_metadata() -> MetadataResponse:
     return MetadataResponse(
         available_models=["persistence", "gradient_boosting"] if trained else ["persistence"],
         active_model=metric_summary(trained[1]) if trained else {},
+        supported_horizons=[1, 6, 24],
     )
 
 
@@ -110,6 +123,22 @@ async def create_forecast(request: ForecastRequest) -> PowerForecast:
             detail="At least one observation required",
         )
 
+    weather_forecast = request.weather_forecast
+    if not weather_forecast and weather_provider is not None:
+        try:
+            weather_obs = weather_provider.fetch_forecast(hours_ahead=request.horizon_hours)
+            weather_forecast = [
+                {
+                    "timestamp": w.timestamp.isoformat(),
+                    "wind_speed_100m": w.wind_speed_100m_mps,
+                    "wind_speed_10m": w.wind_speed_10m_mps,
+                    "temperature": w.temperature_c,
+                }
+                for w in weather_obs
+            ]
+        except Exception:
+            pass
+
     trained = None
     ml_fallback_reason = None
     horizon_mismatch = False
@@ -119,16 +148,13 @@ async def create_forecast(request: ForecastRequest) -> PowerForecast:
             model, metadata = trained
             if metadata.horizon_hours == request.horizon_hours:
                 try:
-                    prediction = model.predict_from_observations(request.observations)
-                    last_timestamp = max(item.timestamp for item in request.observations)
                     points = [
-                        ForecastPoint(
-                            timestamp=last_timestamp + _forecast_step(request.observations) * index,
-                            p50=round(prediction, 3),
-                            p10=round(max(0.0, prediction - model.residual_p90), 3),
-                            p90=round(prediction + model.residual_p90, 3),
+                        ForecastPoint(**point)
+                        for point in forecast_points_from_model(
+                            model,
+                            observations=request.observations,
+                            created_at=request.created_at,
                         )
-                        for index in range(1, request.horizon_hours * 6 + 1)
                     ]
                     return PowerForecast(
                         asset_id=request.asset_id,
@@ -318,14 +344,6 @@ async def root() -> dict[str, str]:
         "health": "/health",
         "risk_endpoints": ["/risk/assess", "/risk/ramps"],
     }
-
-
-def _forecast_step(observations: list[TurbineObservation]) -> timedelta:
-    """Infer forecast cadence using the shared baseline service."""
-    sorted_observations = sorted(observations, key=lambda item: item.timestamp)
-    return forecast_service._infer_step(sorted_observations)
-
-
 if __name__ == "__main__":
     import uvicorn
 

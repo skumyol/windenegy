@@ -108,6 +108,7 @@ def main() -> int:
     print(f"\n  Files saved:")
     print(f"    Model: {result.model_path}")
     print(f"    Metrics: {result.metrics_path}")
+    print(f"    Test outputs: {result.test_predictions_path}")
 
     print(f"\n{'=' * 60}")
     print("Model ready for inference!")

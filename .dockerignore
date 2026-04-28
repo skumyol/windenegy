@@ -6,8 +6,6 @@ __pycache__/
 *.pyc
 .coverage
 artifacts/coverage.xml
-artifacts/models/*
-artifacts/metrics/*.json
 artifacts/reports/*
 dist/
 build/

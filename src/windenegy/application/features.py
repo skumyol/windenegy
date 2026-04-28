@@ -93,6 +93,7 @@ def add_lag_features(
         )
 
     featured["wind_speed_sq"] = featured["wind_speed_mps"] ** 2
+    featured["wind_speed_cb"] = featured["wind_speed_mps"] ** 3
     featured["power_curve_deviation"] = (
         featured["active_power_kw"] - featured["theoretical_power_kwh"]
     )
@@ -103,6 +104,28 @@ def add_lag_features(
     )
     featured["power_rate_of_change"] = featured["active_power_kw"].diff()
     featured["wind_speed_rate_of_change"] = featured["wind_speed_mps"].diff()
+
+    featured["turbulence_intensity"] = np.where(
+        featured["active_power_roll_mean_3"] > 50,
+        featured["active_power_roll_std_3"] / featured["active_power_roll_mean_3"],
+        0.0
+    )
+
+    featured["wind_power_density"] = (
+        0.5 * 1.225 * featured["wind_speed_cb"]
+    )
+
+    featured["capacity_factor"] = np.where(
+        featured["theoretical_power_kwh"] > 100,
+        featured["active_power_kw"] / featured["theoretical_power_kwh"],
+        0.0
+    )
+
+    featured["wind_shear_indicator"] = np.where(
+        featured["wind_speed_mps"] > 3,
+        featured["active_power_kw"] / (featured["wind_speed_sq"] + 1),
+        0.0
+    )
 
     return featured.dropna().reset_index(drop=True)
 
@@ -116,7 +139,9 @@ def build_tabular_feature_frame(
     normalized = normalize_scada_frame(df)
     featured = add_direction_features(normalized)
     featured = add_time_features(featured)
-    return add_lag_features(featured, lags=lags, windows=windows)
+    featured = add_lag_features(featured, lags=lags, windows=windows)
+    featured["persistence_kw"] = featured["active_power_kw"]
+    return featured
 
 
 def build_supervised_feature_frame(

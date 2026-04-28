@@ -31,11 +31,16 @@ def test_train_persist_reload_and_forecast(tmp_path: Path) -> None:
     loaded = load_latest_gradient_boosting(tmp_path / "models")
 
     assert result.metrics_path.exists()
+    assert result.test_predictions_path.exists()
     assert loaded is not None
     model, metadata = loaded
     assert isinstance(model, GradientBoostingPowerModel)
     assert metadata.metrics is not None
     assert metadata.metrics.mae >= 0.0
+
+    test_outputs = pd.read_csv(result.test_predictions_path)
+    assert not test_outputs.empty
+    assert {"timestamp", "actual_kw", "predicted_kw"}.issubset(test_outputs.columns)
 
 
 def test_api_uses_trained_model_when_available(tmp_path: Path) -> None:
@@ -84,7 +89,7 @@ def _write_synthetic_scada(tmp_path: Path, rows: int = 96) -> Path:
 
 def _observation_payload(csv_path: Path) -> list[dict[str, object]]:
     """Return enough recent observations for model feature generation."""
-    frame = pd.read_csv(csv_path).tail(32)
+    frame = pd.read_csv(csv_path).tail(64)
     return [
         {
             "timestamp": row["Date/Time"],

@@ -6,6 +6,7 @@ set -e
 # Commands:
 #   api       - Start FastAPI development server
 #   dashboard - Start Streamlit dashboard
+#   train     - Run unified training pipeline (all models, all horizons)
 #   test      - Run test suite
 #   lint      - Run linting and type checks
 #   install   - Install dependencies
@@ -52,6 +53,15 @@ install_deps() {
         pip install -e ".[dev,all]"
     fi
     echo "Dependencies installed."
+}
+
+run_train() {
+    echo "Running unified training pipeline..."
+    if command -v uv &> /dev/null; then
+        uv run python scripts/train_all.py "$@"
+    else
+        python scripts/train_all.py "$@"
+    fi
 }
 
 run_tests() {
@@ -174,6 +184,10 @@ case "${1:-all}" in
         ;;
     dashboard)
         start_dashboard
+        ;;
+    train)
+        shift
+        run_train "$@"
         ;;
     test)
         run_tests
