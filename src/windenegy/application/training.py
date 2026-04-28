@@ -10,7 +10,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 
 from windenegy.application.evaluation import build_metrics
 from windenegy.application.features import (
@@ -46,6 +46,7 @@ class GradientBoostingPowerModel:
     regressor: GradientBoostingRegressor
     feature_columns: list[str]
     residual_p90: float
+    bias_correction: float
     horizon_hours: int
     model_version: str
     lags: tuple[int, ...]
@@ -68,6 +69,7 @@ class GradientBoostingPowerModel:
             raise ValueError(msg)
         latest_features = feature_frame.iloc[[-1]][self.feature_columns]
         prediction = float(self.regressor.predict(latest_features)[0])
+        prediction = prediction + self.bias_correction
         return max(0.0, prediction)
 
 
@@ -99,24 +101,45 @@ def train_gradient_boosting_from_csv(
         if column not in NON_FEATURE_COLUMNS and pd.api.types.is_numeric_dtype(supervised[column])
     ]
 
-    regressor = GradientBoostingRegressor(random_state=random_state)
-    regressor.fit(train[feature_columns], train[TARGET_COLUMN])
+    train_active = train[train["active_power_kw"] > 100]
+    val_active = validation[validation["active_power_kw"] > 100]
+    test_active = test[test["active_power_kw"] > 100]
 
-    validation_predicted = regressor.predict(validation[feature_columns])
-    residual_p90 = float(
-        np.quantile(np.abs(validation[TARGET_COLUMN].to_numpy() - validation_predicted), 0.9)
+    if len(train_active) < 100:
+        train_active = train
+        val_active = validation
+        test_active = test
+
+    sample_weights = np.ones(len(train_active))
+    active_mask = train_active["active_power_kw"] > 500
+    sample_weights[active_mask] = 2.0
+
+    regressor = GradientBoostingRegressor(
+        n_estimators=300,
+        max_depth=4,
+        learning_rate=0.1,
+        subsample=0.8,
+        min_samples_split=10,
+        min_samples_leaf=5,
+        random_state=random_state,
     )
+    regressor.fit(train_active[feature_columns], train_active[TARGET_COLUMN], sample_weight=sample_weights)
+
+    validation_predicted = regressor.predict(val_active[feature_columns])
+    residuals = val_active[TARGET_COLUMN].to_numpy() - validation_predicted
+    bias_correction = float(np.mean(residuals))
+    residual_p90 = float(np.quantile(np.abs(residuals), 0.9))
     residual_p90 = max(50.0, residual_p90)
 
-    test_predicted = regressor.predict(test[feature_columns])
-    persistence_predicted = test["active_power_kw"].to_numpy()
+    test_predicted = regressor.predict(test_active[feature_columns]) + bias_correction
+    persistence_predicted = test_active["active_power_kw"].to_numpy()
     lower = np.maximum(0.0, test_predicted - residual_p90)
     upper = test_predicted + residual_p90
 
     metrics = build_metrics(
         model_id="gradient_boosting",
         horizon_hours=horizon_hours,
-        actual=test[TARGET_COLUMN].to_numpy(),
+        actual=test_active[TARGET_COLUMN].to_numpy(),
         predicted=test_predicted,
         baseline_predicted=persistence_predicted,
         lower=lower,
@@ -128,6 +151,7 @@ def train_gradient_boosting_from_csv(
         regressor=regressor,
         feature_columns=feature_columns,
         residual_p90=residual_p90,
+        bias_correction=bias_correction,
         horizon_hours=horizon_hours,
         model_version=model_id,
         lags=lags,
@@ -146,6 +170,7 @@ def train_gradient_boosting_from_csv(
             "training_rows": len(train),
             "validation_rows": len(validation),
             "test_rows": len(test),
+            "bias_correction": bias_correction,
             "step_minutes": step_minutes,
             "horizon_steps": horizon_steps,
             "lags": list(lags),
@@ -232,6 +257,7 @@ def _build_training_frame(
 ) -> tuple[pd.DataFrame, tuple[int, ...], tuple[int, ...]]:
     """Build training features, falling back to smaller lags for tiny smoke-test data."""
     feature_sets = [
+        ((1, 3, 6, 12, 24, 36, 48), (3, 6, 12, 24, 48)),
         ((1, 3, 6, 12, 24), (3, 6, 12)),
         ((1, 3, 6), (3, 6)),
         ((1,), (2,)),

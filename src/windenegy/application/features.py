@@ -88,6 +88,21 @@ def add_lag_features(
         featured[f"wind_speed_roll_mean_{window}"] = (
             featured["wind_speed_mps"].rolling(window).mean()
         )
+        featured[f"active_power_roll_std_{window}"] = (
+            featured["active_power_kw"].rolling(window).std()
+        )
+
+    featured["wind_speed_sq"] = featured["wind_speed_mps"] ** 2
+    featured["power_curve_deviation"] = (
+        featured["active_power_kw"] - featured["theoretical_power_kwh"]
+    )
+    featured["power_efficiency"] = np.where(
+        featured["theoretical_power_kwh"] > 50,
+        featured["active_power_kw"] / featured["theoretical_power_kwh"],
+        1.0
+    )
+    featured["power_rate_of_change"] = featured["active_power_kw"].diff()
+    featured["wind_speed_rate_of_change"] = featured["wind_speed_mps"].diff()
 
     return featured.dropna().reset_index(drop=True)
 

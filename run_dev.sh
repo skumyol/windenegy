@@ -97,8 +97,78 @@ start_dashboard() {
     fi
 }
 
+free_port() {
+    local port=$1
+    local pids
+    pids=$(lsof -ti tcp:"$port" 2>/dev/null || true)
+    if [ -n "$pids" ]; then
+        echo "  Port $port already in use by PID(s): $pids — killing..."
+        # shellcheck disable=SC2086
+        kill -9 $pids 2>/dev/null || true
+        sleep 1
+    fi
+}
+
+start_all() {
+    echo "Starting API on port $API_PORT and dashboard on port $DASHBOARD_PORT..."
+    echo "Press Ctrl+C to stop both."
+    export WINDENEGY_ENV=development
+    export WINDENEGY_DEBUG=true
+    export WINDENEGY_API_RELOAD=true
+
+    mkdir -p logs
+
+    # Free ports if in use
+    free_port "$API_PORT"
+    free_port "$DASHBOARD_PORT"
+
+    # Start API in background
+    if command -v uv &> /dev/null; then
+        uv run uvicorn windenegy.interface.api:app --host 0.0.0.0 --port "$API_PORT" --reload \
+            > logs/api.log 2>&1 &
+    else
+        uvicorn windenegy.interface.api:app --host 0.0.0.0 --port "$API_PORT" --reload \
+            > logs/api.log 2>&1 &
+    fi
+    API_PID=$!
+    echo "  API     -> http://localhost:$API_PORT  (pid $API_PID, logs: logs/api.log)"
+
+    # Start dashboard in background
+    if command -v uv &> /dev/null; then
+        uv run streamlit run src/windenegy/interface/dashboard.py \
+            --server.port "$DASHBOARD_PORT" --server.headless true \
+            > logs/dashboard.log 2>&1 &
+    else
+        streamlit run src/windenegy/interface/dashboard.py \
+            --server.port "$DASHBOARD_PORT" --server.headless true \
+            > logs/dashboard.log 2>&1 &
+    fi
+    DASH_PID=$!
+    echo "  Dashboard -> http://localhost:$DASHBOARD_PORT  (pid $DASH_PID, logs: logs/dashboard.log)"
+
+    # Cleanup on exit
+    cleanup() {
+        echo ""
+        echo "Shutting down..."
+        kill "$API_PID" "$DASH_PID" 2>/dev/null || true
+        wait "$API_PID" "$DASH_PID" 2>/dev/null || true
+        echo "Stopped."
+    }
+    trap cleanup INT TERM EXIT
+
+    # Tail combined logs
+    sleep 2
+    echo ""
+    echo "Streaming combined logs (Ctrl+C to stop both servers):"
+    echo "-------------------------------------------------------"
+    tail -F logs/api.log logs/dashboard.log
+}
+
 # Main command dispatcher
-case "${1:-}" in
+case "${1:-all}" in
+    all)
+        start_all
+        ;;
     api)
         start_api
         ;;
@@ -117,14 +187,15 @@ case "${1:-}" in
     --check)
         check_servers
         ;;
-    *)
+    -h|--help|help)
         echo "Windenegy Development Runner"
         echo ""
         echo "Usage: $0 [command]"
         echo ""
         echo "Commands:"
-        echo "  api         Start FastAPI development server"
-        echo "  dashboard   Start Streamlit dashboard"
+        echo "  (none)|all  Start API + dashboard together (default)"
+        echo "  api         Start FastAPI development server only"
+        echo "  dashboard   Start Streamlit dashboard only"
         echo "  test        Run test suite"
         echo "  lint        Run linting and type checks"
         echo "  install     Install dependencies"
@@ -133,6 +204,11 @@ case "${1:-}" in
         echo "Environment variables:"
         echo "  WINDENEGY_API_PORT        API server port (default: 8765)"
         echo "  WINDENEGY_DASHBOARD_PORT  Dashboard port (default: 8766)"
+        exit 0
+        ;;
+    *)
+        echo "Unknown command: $1"
+        echo "Run '$0 --help' for usage."
         exit 1
         ;;
 esac
