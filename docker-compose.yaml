@@ -16,9 +16,6 @@ services:
       - WINDENEGY_DATA_RAW_PATH=/app/data/raw
       - WINDENEGY_MODEL_ARTIFACTS_PATH=/app/artifacts/models
       - WINDENEGY_WEATHER_PROVIDER=openmeteo
-    volumes:
-      - data:/app/data:ro
-      - artifacts:/app/artifacts
     command: uvicorn windenegy.interface.api:app --host 0.0.0.0 --port 8765
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8765/health"]
@@ -50,10 +47,6 @@ services:
     networks:
       - windenegy-network
     restart: unless-stopped
-
-volumes:
-  data:
-  artifacts:
 
 networks:
   windenegy-network:

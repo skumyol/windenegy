@@ -321,6 +321,7 @@ def _build_prediction_overlay_frame(
 def _build_patchtst_sequence(input_slice: pd.DataFrame, seq_len: int) -> np.ndarray:
     """Build the sequence tensor used by the PatchTST stand-in."""
     feature_cols = [
+        "active_power_kw",
         "wind_speed_mps",
         "theoretical_power_kwh",
         "wind_direction_deg",
@@ -330,6 +331,49 @@ def _build_patchtst_sequence(input_slice: pd.DataFrame, seq_len: int) -> np.ndar
         msg = f"Need at least {seq_len} observations for PatchTST prediction"
         raise ValueError(msg)
     return frame[feature_cols].to_numpy(dtype=float)
+
+
+def _baseline_forecast_points(
+    input_slice: pd.DataFrame,
+    horizon_hours: int,
+    step_minutes: float = 10.0,
+) -> dict[str, list[dict[str, Any]]]:
+    """Generate persistence, power-curve, and rolling-mean forecasts from a window."""
+    if input_slice.empty or "timestamp" not in input_slice.columns:
+        return {}
+    timestamps = pd.to_datetime(input_slice["timestamp"], utc=True)
+    step = pd.Timedelta(minutes=step_minutes)
+    last_ts = timestamps.iloc[-1]
+    horizon_steps = max(1, int(round(horizon_hours * 60 / step_minutes)))
+    forecast_ts = [last_ts + step * (i + 1) for i in range(horizon_steps)]
+
+    last_power = float(input_slice["active_power_kw"].iloc[-1])
+    last_theoretical = (
+        float(input_slice["theoretical_power_kwh"].iloc[-1])
+        if "theoretical_power_kwh" in input_slice.columns
+        else last_power
+    )
+    rolling_mean = float(input_slice["active_power_kw"].tail(36).mean())
+    # simple residual from recent std
+    recent_std = float(input_slice["active_power_kw"].tail(36).std()) if len(input_slice) >= 6 else 200.0
+    resid = max(50.0, recent_std * 1.5)
+
+    def _points(value: float) -> list[dict[str, Any]]:
+        return [
+            {
+                "timestamp": ts.isoformat(),
+                "p50": round(float(value), 3),
+                "p10": round(max(0.0, float(value) - resid), 3),
+                "p90": round(float(value) + resid, 3),
+            }
+            for ts in forecast_ts
+        ]
+
+    return {
+        "persistence": _points(last_power),
+        "power_curve": _points(last_theoretical),
+        "rolling_mean": _points(rolling_mean),
+    }
 
 
 def _forecast_from_model_artifact(
@@ -381,14 +425,35 @@ def _forecast_from_model_artifact(
             config_snapshot = metadata.config_snapshot or {}
             seq_len = int(config_snapshot.get("seq_len", 144))
             residual_p90 = float(config_snapshot.get("residual_p90", 200.0))
+            pred_len = int(config_snapshot.get("pred_len", 6))
+
             if len(input_slice) < seq_len:
                 return None
-            sequence = _build_patchtst_sequence(input_slice, seq_len)
-            prediction = np.asarray(model.predict(sequence), dtype=float).flatten()
+
+            # Handle both dict format and object format
+            if isinstance(model, dict):
+                regressor = model.get("regressor")
+                scaler = model.get("scaler")
+                if regressor is None:
+                    return None
+                # Build sequence and scale it
+                sequence = _build_patchtst_sequence(input_slice, seq_len)
+                # Flatten to (1, 576) for the regressor
+                sequence_flat = sequence.flatten().reshape(1, -1)
+                if scaler is not None:
+                    try:
+                        sequence_flat = scaler.transform(sequence_flat)
+                    except Exception:
+                        pass
+                prediction = np.asarray(regressor.predict(sequence_flat), dtype=float).flatten()
+            else:
+                # Object format
+                sequence = _build_patchtst_sequence(input_slice, seq_len)
+                prediction = np.asarray(model.predict(sequence), dtype=float).flatten()
+
             if prediction.size == 0:
                 return None
 
-            pred_len = int(config_snapshot.get("pred_len", len(prediction)))
             if prediction.size == 1 and pred_len > 1:
                 prediction = np.repeat(prediction, pred_len)
 
@@ -714,31 +779,37 @@ with tab_predict:
 
             forecast = request_forecast(observations, horizon)
             model_overlays: list[dict[str, Any]] = []
-            if not models:
+
+            # API forecast (primary)
+            if forecast is not None:
                 model_overlays.append(
                     {
-                        "label": forecast.get("model_version", "active-model") if forecast else "active-model",
-                        "color": MODEL_COLORS[0],
-                        "points": forecast.get("forecast", []) if forecast else [],
-                    }
-                )
-            else:
-                for index, model_meta in enumerate(models):
-                    points = _forecast_from_model_artifact(model_meta, input_slice)
-                    if points:
-                        model_overlays.append(
-                            {
-                                "label": f"{model_meta.get('model_version', 'model')}",
-                                "color": MODEL_COLORS[index % len(MODEL_COLORS)],
-                                "points": points,
-                            }
-                        )
-            if not model_overlays and forecast is not None:
-                model_overlays.append(
-                    {
-                        "label": forecast.get("model_version", "active-model"),
+                        "label": forecast.get("model_version", "api-forecast"),
                         "color": MODEL_COLORS[0],
                         "points": forecast.get("forecast", []),
+                    }
+                )
+
+            # Artifact-based models
+            for index, model_meta in enumerate(models):
+                points = _forecast_from_model_artifact(model_meta, input_slice)
+                if points:
+                    model_overlays.append(
+                        {
+                            "label": f"{model_meta.get('model_version', 'model')}",
+                            "color": MODEL_COLORS[(index + 1) % len(MODEL_COLORS)],
+                            "points": points,
+                        }
+                    )
+
+            # Baseline forecasts (computed on-the-fly)
+            baseline_points = _baseline_forecast_points(input_slice, horizon)
+            for idx, (name, points) in enumerate(baseline_points.items()):
+                model_overlays.append(
+                    {
+                        "label": name.replace("_", " ").title(),
+                        "color": MODEL_COLORS[(len(models) + idx + 1) % len(MODEL_COLORS)],
+                        "points": points,
                     }
                 )
             primary_model = model_overlays[0] if model_overlays else None
