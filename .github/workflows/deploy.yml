@@ -21,6 +21,22 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Download dataset
+        run: |
+          mkdir -p data/raw
+          # Download from public URL or use cached data
+          # For Kaggle datasets, use kaggle API or manual download
+          echo "Data download step - ensure T1.csv is available"
+
+      - name: Setup uv and train models
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          export PATH="$HOME/.cargo/bin:$PATH"
+          uv venv
+          source .venv/bin/activate
+          uv pip install -e "."
+          ./install.sh
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
