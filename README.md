@@ -18,18 +18,6 @@ This project demonstrates:
 - **Operational Focus**: API and dashboard built for operators, not researchers
 - **Production Practices**: CI/CD, testing, type safety, containerization
 
-## Stellerus Alignment
-
-This prototype maps to Stellerus themes:
-
-| Theme | Implementation |
-|-------|---------------|
-| Climate Intelligence | Forecasts framed as decision support for climate-exposed assets |
-| Data Fusion | SCADA + weather covariates with interface for satellite/radar |
-| Physics-Guided AI | Power curve baselines, feature constraints, sanity checks |
-| Risk & Resilience | Ramp event detection, low-confidence windows |
-| Platform Thinking | API-first, versioned artifacts, reproducible pipelines |
-
 ## Architecture
 
 Clean Architecture with clear separation:
@@ -485,4 +473,3 @@ MIT License - See LICENSE file
 ## Acknowledgments
 
 - Kaggle for the Turkey Wind Turbine dataset
-- Stellerus for the climate intelligence inspiration
