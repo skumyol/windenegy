@@ -123,6 +123,36 @@ cd windenegy
 
 ### Production Deployment
 
+#### Option 1: Build Locally, Deploy to VPS
+
+**Step 1: Prepare on your local machine**
+
+```bash
+# Clone and install
+git clone <repo-url>
+cd windenegy
+
+# Run install script (downloads data, trains models)
+./install.sh
+
+# Copy data and models to VPS
+./copy_data_to_vps.sh ~/.ssh/your_key
+```
+
+**Step 2: On VPS, just run Docker**
+
+```bash
+ssh root@147.93.110.53
+cd ~/windenegy
+docker-compose up --build -d
+```
+
+Access:
+- Dashboard: `http://147.93.110.53:8766`
+- API: `http://147.93.110.53:8765`
+
+#### Option 2: Local Docker Deployment
+
 ```bash
 # Build and start all services
 ./run_prod.sh build
@@ -143,6 +173,14 @@ Or use Docker Compose directly:
 ```bash
 docker-compose up --build
 ```
+
+#### Option 3: GitHub Actions → VPS
+
+Set up GitHub Actions to auto-deploy on push to main:
+
+1. Add VPS secrets to GitHub (`VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY`)
+2. Push to main triggers `.github/workflows/deploy.yml`
+3. Image builds with models baked in, deploys to VPS
 
 ## Project Structure
 
@@ -299,10 +337,22 @@ Raw CSV → Validation → Normalization → Split → Features → Model
 
 ### Implemented
 
-- **Persistence Baseline**: Last observed power with adaptive uncertainty spread
-- **Gradient Boosting**: LightGBM with time/lag features (25 features)
-- **PatchTST**: Sequence transformer using 24-step input windows
-- **Conformal Prediction**: P10/P90 intervals with 90% target coverage
+| Model | Description | Features |
+|-------|-------------|----------|
+| **Persistence Baseline** | Last observed power | Adaptive uncertainty spread |
+| **Gradient Boosting** | LightGBM with physics features | 25+ features (lags, rolling stats, weather) |
+| **PatchTST** | Sequence transformer | 144-step input windows, MLP surrogate |
+| **Multi-Horizon** | 1h, 6h, 24h models | Consistent test set for fair comparison |
+| **Conformal Prediction** | P10/P90 intervals | 90% target coverage guarantee |
+
+**Training scripts**:
+```bash
+# Train all gradient boosting models
+python scripts/train_all_models.py
+
+# Train specific PatchTST model
+python scripts/train_patchtst.py --horizon 6
+```
 
 ## Testing
 
@@ -344,17 +394,28 @@ All sprints completed:
 | **3: Sequence Model** | PatchTST, model registry, comparison | ✅ |
 | **4: Uncertainty** | Conformal intervals, ramp detection | ✅ |
 | **5: API & Dashboard** | FastAPI, Streamlit, Docker Compose | ✅ |
-| **6: Portfolio** | Model cards, documentation | ✅ |
+| **6: Multi-Horizon** | 1h/6h/24h models, consistent test sets | ✅ |
+| **7: Deployment** | VPS deploy scripts, GitHub Actions, baked images | ✅ |
 
 ### Model Performance (Test Set)
 
-| Model | MAE (kW) | RMSE (kW) | Skill vs Persistence |
-|-------|----------|-----------|---------------------|
-| Persistence | 116 | 225 | — |
-| Gradient Boosting | 355 | 512 | -0.30 |
-| PatchTST (1h) | 597 | 1217 | **+0.59** |
+All models trained on consistent 20% test split for fair comparison:
 
-**Note**: PatchTST shows positive skill score (59% error reduction vs persistence) on 1-hour horizon using 24-hour input sequences. Gradient Boosting underperforms due to feature dimensionality constraints with minimal feature engineering.
+| Model | Horizon | MAE (kW) | RMSE (kW) | Skill Score | P90 Coverage |
+|-------|---------|----------|-----------|-------------|--------------|
+| **PatchTST** | 1h | 597 | 1217 | **+0.59** | 88.5% |
+| **PatchTST** | 6h | 503 | 898 | **+0.65** | 93.5% |
+| **PatchTST** | 24h | 550 | 953 | **+0.63** | 94.7% |
+| Gradient Boosting | 1h | 364 | 542 | +0.003 | 89.4% |
+| Gradient Boosting | 6h | 791 | 1075 | +0.021 | 87.6% |
+| Gradient Boosting | 24h | 1227 | 1526 | +0.050 | 87.6% |
+| Persistence | — | 116 | 225 | — | — |
+
+**Key findings**:
+- PatchTST significantly outperforms Gradient Boosting (skill 0.63 vs 0.05 on 24h)
+- All models use consistent test set (~7,600 rows) for fair comparison
+- Gradient Boosting uses delta-to-persistence with time-decay uncertainty
+- PatchTST uses 144-step input windows with MLP surrogate
 
 ## System Design Decisions
 
