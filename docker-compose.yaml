@@ -8,6 +8,9 @@ services:
     container_name: windenegy-api
     ports:
       - "8765:8765"
+    volumes:
+      - ./data:/app/data
+      - ./artifacts:/app/artifacts
     environment:
       - WINDENEGY_ENV=production
       - WINDENEGY_API_HOST=0.0.0.0
@@ -36,14 +39,18 @@ services:
     container_name: windenegy-dashboard
     ports:
       - "8766:8766"
+    volumes:
+      - ./data:/app/data
+      - ./artifacts:/app/artifacts
     environment:
       - WINDENEGY_ENV=production
       - WINDENEGY_DASHBOARD_PORT=8766
       - WINDENEGY_DASHBOARD_API_URL=http://api:8765
+      - WINDENEGY_MODEL_ARTIFACTS_PATH=/app/artifacts/models
     depends_on:
       api:
         condition: service_healthy
-    command: streamlit run src/windenegy/interface/dashboard.py --server.port 8766 --server.address 0.0.0.0
+    command: streamlit run src/windenegy/interface/dashboard.py --server.port 8766 --server.address 0.0.0.0 --server.baseUrlPath /wind
     networks:
       - windenegy-network
     restart: unless-stopped
