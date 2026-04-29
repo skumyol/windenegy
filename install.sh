@@ -40,6 +40,14 @@ check_prerequisites() {
         log_warn "Docker not found. You'll need Docker to run the application"
     fi
     
+    # Check for Alpine Linux and install build tools
+    if [ -f "/etc/alpine-release" ]; then
+        log_info "Alpine Linux detected, installing build dependencies..."
+        if ! command -v gcc &> /dev/null; then
+            apk add --no-cache gcc g++ musl-dev linux-headers cmake make libgomp
+        fi
+    fi
+    
     if ! command -v uv &> /dev/null; then
         log_info "Installing uv..."
         curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -51,35 +59,36 @@ check_prerequisites() {
 
 # Download SCADA data
 download_data() {
-    log_info "Downloading SCADA data..."
+    log_info "Checking for SCADA data..."
     
     if [ -f "data/raw/T1.csv" ]; then
         log_warn "Data already exists at data/raw/T1.csv"
         read -p "Re-download? (y/N): " -n 1 -r
         echo
         if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-            log_info "Skipping data download"
+            log_info "Using existing data"
             return
         fi
     fi
     
     mkdir -p data/raw
     
-    # Download from Kaggle or other source
-    # For now, check if user has the file
+    # Auto-download using the script
+    log_info "Attempting to download dataset..."
+    if command -v kaggle &> /dev/null; then
+        uv run python scripts/download_scada.py
+    else
+        log_warn "Kaggle CLI not found. Installing..."
+        uv pip install kaggle
+        uv run python scripts/download_scada.py
+    fi
+    
+    # Check if download succeeded
     if [ ! -f "data/raw/T1.csv" ]; then
-        log_warn "Please download T1.csv from the SCADA dataset source"
-        log_info "Expected location: data/raw/T1.csv"
-        log_info ""
-        log_info "You can download the dataset from:"
-        log_info "https://www.kaggle.com/datasets/berkerboy/wind-turbine-scada-dataset"
-        log_info ""
-        read -p "Press Enter when data is in place..."
-        
-        if [ ! -f "data/raw/T1.csv" ]; then
-            log_error "Data file not found at data/raw/T1.csv"
-            exit 1
-        fi
+        log_error "Auto-download failed. Please download manually:"
+        log_info "https://www.kaggle.com/datasets/berkerisen/wind-turbine-scada-dataset"
+        log_info "Place T1.csv in data/raw/"
+        exit 1
     fi
     
     log_info "Data ready at data/raw/T1.csv"
